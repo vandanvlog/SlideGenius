@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  color: #111827;
+}
+
+body {
+  font-feature-settings: 'cv11', 'ss01';
+  -webkit-font-smoothing: antialiased;
+  background-color: #0b1224;
+  background-image:
+    radial-gradient(50rem 50rem at 110% -10%, rgba(139, 92, 246, 0.25), transparent 60%),
+    radial-gradient(45rem 45rem at -10% 0%, rgba(59, 130, 246, 0.22), transparent 55%),
+    linear-gradient(180deg, #0b1224 0%, #0e1330 55%, #140f30 100%);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* Brand gradient helpers */
+.text-gradient {
+  background-image: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.bg-brand {
+  background-image: linear-gradient(90deg, #3b82f6 0%, #8b5cf6 100%);
+}
+
+@keyframes scaleIn {
+  from {
+    transform: scale(0.6);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
