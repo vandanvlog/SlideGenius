@@ -1,265 +1,245 @@
 'use client';
 
-import { useCallback, useState } from 'react';
-import UploadZone from '@/components/UploadZone';
-import PromptInput from '@/components/PromptInput';
-import StyleSelector from '@/components/StyleSelector';
-import SlideCountSelector from '@/components/SlideCountSelector';
-import GenerateButton from '@/components/GenerateButton';
-import LoadingScreen from '@/components/LoadingScreen';
-import SuccessScreen from '@/components/SuccessScreen';
-import ErrorMessage from '@/components/ErrorMessage';
-import type { PresentationStyle, SlideCount } from '@/lib/types';
-
-type AppState = 'idle' | 'loading' | 'success';
-
-interface Result {
-  blobUrl: string;
-  fileName: string;
-  slideCount: number;
-  fileSizeBytes: number;
-}
-
-// Read a File into a base64 string (without the data: prefix).
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const comma = result.indexOf(',');
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(new Error('Could not read file.'));
-    reader.readAsDataURL(file);
-  });
-}
-
-const TIPS = [
-  'Be specific — the clearer your input, the sharper your slides.',
-  'Works with any content: research, reports, or a quick idea.',
-  'Every deck includes real images and speaker notes.',
-];
+import { useCallback, useRef, useState } from 'react';
+import ChatPanel, { type GeneratePayload } from '@/components/ChatPanel';
+import PreviewPanel from '@/components/PreviewPanel';
+import SlideFeedback from '@/components/SlideFeedback';
+import { DEFAULT_PALETTE_ID } from '@/lib/palettes';
+import { IMAGE_SLIDE_TYPES } from '@/lib/slide-templates';
+import type { AppPhase, SlideData } from '@/lib/types';
 
 export default function Home() {
-  const [state, setState] = useState<AppState>('idle');
-
-  const [fileContent, setFileContent] = useState('');
-  const [fileName, setFileName] = useState('');
-  const [prompt, setPrompt] = useState('');
-  const [selectedStyle, setSelectedStyle] = useState<PresentationStyle>('business');
-  const [selectedSlideCount, setSelectedSlideCount] = useState<SlideCount>('10');
-
+  const [phase, setPhase] = useState<AppPhase>('input');
   const [error, setError] = useState<string | null>(null);
-  const [inputError, setInputError] = useState(false);
-  const [result, setResult] = useState<Result | null>(null);
 
-  const handleFileSelect = useCallback(async (file: File) => {
+  const [slides, setSlides] = useState<SlideData[]>([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [presentationType, setPresentationType] = useState('business');
+  const [paletteId, setPaletteId] = useState<string>(DEFAULT_PALETTE_ID);
+
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isRefining, setIsRefining] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Bump to remount ChatPanel on reset (clears its internal form state).
+  const [chatKey, setChatKey] = useState(0);
+  const customImagesRef = useRef<string[]>([]);
+
+  const handleGenerate = useCallback(async (payload: GeneratePayload) => {
     setError(null);
-    setInputError(false);
-    const lower = file.name.toLowerCase();
-    if (!lower.endsWith('.pdf') && !lower.endsWith('.docx')) {
-      setError('Please upload a PDF or Word (.docx) file.');
-      return;
-    }
-    try {
-      const base64 = await fileToBase64(file);
-      setFileContent(base64);
-      setFileName(file.name);
-      // A file overrides any typed prompt to keep the request unambiguous.
-      setPrompt('');
-    } catch {
-      setError('We could not read that file. Please try another.');
-    }
-  }, []);
-
-  const handleClearFile = useCallback(() => {
-    setFileContent('');
-    setFileName('');
-  }, []);
-
-  const handleGenerate = useCallback(async () => {
-    const hasFile = Boolean(fileContent && fileName);
-    const hasPrompt = prompt.trim().length > 0;
-
-    if (!hasFile && !hasPrompt) {
-      setInputError(true);
-      setError('Please upload a file or describe your presentation.');
-      return;
-    }
-
-    setError(null);
-    setInputError(false);
-    setState('loading');
+    setIsGenerating(true);
+    setPhase('generating');
+    setPresentationType(payload.presentationType);
+    setPaletteId(payload.paletteId);
+    customImagesRef.current = payload.customImageDataUrls;
 
     try {
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          fileContent: hasFile ? fileContent : undefined,
-          fileName: hasFile ? fileName : undefined,
-          prompt: hasPrompt ? prompt.trim() : undefined,
-          style: selectedStyle,
-          slideCount: selectedSlideCount,
+          description: payload.description,
+          presentationType: payload.presentationType,
+          slideCount: payload.slideCount,
+          hasCustomImages: payload.hasCustomImages,
+          customImageCount: payload.customImageDataUrls.length,
+          attachedFiles: payload.attachedFiles,
+          paletteId: payload.paletteId,
         }),
       });
 
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setError(data?.error?.message ?? 'Generation failed. Please try again.');
+        setPhase('input');
+        return;
+      }
+
+      let resultSlides: SlideData[] = data.slides;
+      // Distribute user-uploaded images in order onto ONLY the slides that
+      // actually display an image, so none are wasted on covers/stats/quotes.
+      if (payload.hasCustomImages && customImagesRef.current.length > 0) {
+        const imgs = customImagesRef.current;
+        let k = 0;
+        resultSlides = resultSlides.map((s) => {
+          if (IMAGE_SLIDE_TYPES.includes(s.type) && k < imgs.length) {
+            return { ...s, imageUrl: imgs[k++] };
+          }
+          return s;
+        });
+      }
+
+      setSlides(resultSlides);
+      setCurrentIndex(0);
+      setPhase('preview');
+    } catch {
+      setError('Network error. Please check your connection and try again.');
+      setPhase('input');
+    } finally {
+      setIsGenerating(false);
+    }
+  }, []);
+
+  const handleRefine = useCallback(
+    async (feedback: string, newImageDataUrl?: string) => {
+      const slide = slides[currentIndex];
+      if (!slide) return;
+      setError(null);
+      setIsRefining(true);
+      try {
+        const res = await fetch('/api/refine-slide', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            slide,
+            feedback,
+            presentationType,
+            newImage: newImageDataUrl,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          setError(data?.error?.message ?? "Couldn't refine that slide.");
+          return;
+        }
+        setSlides((prev) =>
+          prev.map((s, i) => (i === currentIndex ? data.updatedSlide : s))
+        );
+      } catch {
+        setError('Network error while refining. Please try again.');
+      } finally {
+        setIsRefining(false);
+      }
+    },
+    [slides, currentIndex, presentationType]
+  );
+
+  const handleDownload = useCallback(async () => {
+    if (slides.length === 0) return;
+    setError(null);
+    setIsExporting(true);
+    try {
+      const res = await fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slides, paletteId }),
+      });
       if (!res.ok) {
-        let message = 'We could not generate your presentation. Please try again.';
+        let message = "Couldn't build the PowerPoint file.";
         try {
           const data = await res.json();
           if (data?.error?.message) message = data.error.message;
         } catch {
-          /* non-JSON error body — keep default message */
+          /* binary or empty */
         }
         setError(message);
-        setState('idle');
         return;
       }
-
       const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const slideCount = parseInt(
-        res.headers.get('X-Slide-Count') ?? selectedSlideCount,
-        10
-      );
+      const url = URL.createObjectURL(blob);
       const disposition = res.headers.get('Content-Disposition') ?? '';
       const match = disposition.match(/filename="([^"]+)"/);
-      const downloadName = match?.[1] ?? 'Presentation.pptx';
-
-      setResult({
-        blobUrl,
-        fileName: downloadName,
-        slideCount,
-        fileSizeBytes: blob.size,
-      });
-      setState('success');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = match?.[1] ?? 'Presentation.pptx';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch {
-      setError('Network error. Please check your connection and try again.');
-      setState('idle');
+      setError('Network error while exporting. Please try again.');
+    } finally {
+      setIsExporting(false);
     }
-  }, [fileContent, fileName, prompt, selectedStyle, selectedSlideCount]);
+  }, [slides, paletteId]);
 
-  const handleDownload = useCallback(() => {
-    if (!result) return;
-    const a = document.createElement('a');
-    a.href = result.blobUrl;
-    a.download = result.fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  }, [result]);
-
-  const handleCreateAnother = useCallback(() => {
-    if (result) URL.revokeObjectURL(result.blobUrl);
-    setResult(null);
-    setFileContent('');
-    setFileName('');
-    setPrompt('');
-    setSelectedStyle('business');
-    setSelectedSlideCount('10');
+  const handleReset = useCallback(() => {
+    setPhase('input');
+    setSlides([]);
+    setCurrentIndex(0);
     setError(null);
-    setInputError(false);
-    setState('idle');
-  }, [result]);
+    setPresentationType('business');
+    setPaletteId(DEFAULT_PALETTE_ID);
+    customImagesRef.current = [];
+    setChatKey((k) => k + 1);
+  }, []);
+
+  // Split (refine | preview) layout only once slides exist.
+  const isPreview = phase === 'preview';
 
   return (
     <main className="flex min-h-screen flex-col">
-      {/* Top bar — logo pinned top-left, help pinned top-right */}
-      <header className="flex items-center justify-between px-5 py-5 sm:px-8">
-        <div className="flex items-center gap-3">
-          <span className="bg-brand flex h-11 w-11 items-center justify-center rounded-xl text-xl shadow-md shadow-primary/40">
-            ✨
-          </span>
-          <div>
-            <h1 className="text-gradient text-2xl font-bold tracking-tight sm:text-3xl">
-              SlideGenius
-            </h1>
-            <p className="text-sm text-white/60">AI Presentation Maker</p>
-          </div>
-        </div>
+      {/* Minimal top bar */}
+      <div className="flex items-center justify-between px-5 py-3 sm:px-8">
+        <span className="text-sm font-semibold tracking-tight text-text-muted">
+          SlideGenius
+        </span>
         <a
           href="https://github.com/vandanvlog/SlideGenius"
           target="_blank"
           rel="noreferrer"
-          className="flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-white/10 text-white/70 backdrop-blur transition-colors hover:border-white/40 hover:text-white"
+          className="flex h-8 w-8 items-center justify-center rounded-full border border-border bg-surface text-text-muted transition-colors hover:border-primary/50 hover:text-text-primary"
           aria-label="Help"
         >
           ?
         </a>
-      </header>
-
-      <div className="mx-auto w-full max-w-2xl flex-1 px-4 pb-12 pt-2">
-        <div className="overflow-hidden rounded-2xl border border-white/10 bg-white shadow-2xl shadow-black/40">
-        <div className="bg-brand h-1.5 w-full" />
-        <div className="p-6">
-        {state === 'loading' && <LoadingScreen />}
-
-        {state === 'success' && result && (
-          <SuccessScreen
-            fileName={result.fileName}
-            slideCount={result.slideCount}
-            fileSizeBytes={result.fileSizeBytes}
-            onDownload={handleDownload}
-            onCreateAnother={handleCreateAnother}
-          />
-        )}
-
-        {state === 'idle' && (
-          <div className="flex flex-col gap-6">
-            <UploadZone
-              fileName={fileName}
-              onFileSelect={handleFileSelect}
-              onClear={handleClearFile}
-            />
-
-            <div className="flex items-center gap-3">
-              <span className="h-px flex-1 bg-border" />
-              <span className="text-xs font-semibold uppercase tracking-wide text-text-subtle">
-                or
-              </span>
-              <span className="h-px flex-1 bg-border" />
-            </div>
-
-            <PromptInput
-              value={prompt}
-              onChange={(v) => {
-                setPrompt(v);
-                if (inputError) setInputError(false);
-              }}
-              error={inputError}
-            />
-
-            <StyleSelector value={selectedStyle} onChange={setSelectedStyle} />
-            <SlideCountSelector
-              value={selectedSlideCount}
-              onChange={setSelectedSlideCount}
-            />
-
-            {error && <ErrorMessage message={error} onRetry={handleGenerate} />}
-
-            <GenerateButton onClick={handleGenerate} />
-
-            <div className="border-t border-border pt-4">
-              <p className="mb-2 text-sm font-semibold text-text-primary">Tips</p>
-              <ul className="space-y-1">
-                {TIPS.map((tip) => (
-                  <li key={tip} className="flex gap-2 text-sm text-text-muted">
-                    <span className="text-primary">•</span>
-                    {tip}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        )}
-        </div>
-        </div>
-
-        <footer className="mt-6 text-center text-xs text-white/40">
-          Built with Next.js, Claude, and Unsplash.
-        </footer>
       </div>
+
+      {isPreview ? (
+        // ---- Preview phase: left = start over + refine, right = slide preview ----
+        <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col gap-4 px-4 pb-6 md:flex-row md:px-6">
+          {/* LEFT — start over + refine */}
+          <section className="flex flex-col gap-4 overflow-y-auto rounded-2xl border border-border bg-surface p-5 shadow-xl shadow-black/30 md:h-[calc(100vh-6rem)] md:w-[38%]">
+            <button
+              type="button"
+              onClick={handleReset}
+              className="self-start rounded-lg border border-border bg-field px-4 py-2 text-sm font-semibold text-text-primary transition-colors hover:border-primary/50"
+            >
+              ← Start over
+            </button>
+
+            {error && (
+              <div className="rounded-lg border border-error/40 bg-error/10 px-3 py-2 text-sm text-error">
+                {error}
+              </div>
+            )}
+
+            <SlideFeedback
+              key={currentIndex}
+              slideNumber={currentIndex + 1}
+              isLoading={isRefining}
+              onApply={handleRefine}
+            />
+
+            <p className="text-xs text-text-subtle">
+              Your edit updates the slide shown on the right. Use Prev / Next to
+              move between slides.
+            </p>
+          </section>
+
+          {/* RIGHT — slide preview + download */}
+          <section className="overflow-y-auto rounded-2xl border border-border bg-surface p-5 shadow-xl shadow-black/30 md:h-[calc(100vh-6rem)] md:flex-1">
+            <PreviewPanel
+              slides={slides}
+              paletteId={paletteId}
+              currentIndex={currentIndex}
+              onIndexChange={setCurrentIndex}
+              isExporting={isExporting}
+              onDownload={handleDownload}
+            />
+          </section>
+        </div>
+      ) : (
+        // ---- Input / questions / generating: centered single column ----
+        <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col justify-center px-4 pb-[8vh]">
+          <ChatPanel
+            key={chatKey}
+            isLoading={isGenerating}
+            error={error}
+            onGenerate={handleGenerate}
+          />
+        </div>
+      )}
     </main>
   );
 }

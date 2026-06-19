@@ -8,17 +8,20 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        primary: '#3B82F6',
-        secondary: '#8B5CF6',
+        // Professional dark slate + indigo theme
+        primary: '#6366F1', // indigo accent
+        secondary: '#4F46E5',
+        accent: '#10B981',
         success: '#10B981',
-        error: '#EF4444',
+        error: '#F87171',
         warning: '#F59E0B',
-        background: '#FFFFFF',
-        surface: '#F9FAFB',
-        'text-primary': '#111827',
-        'text-muted': '#6B7280',
-        'text-subtle': '#9CA3AF',
-        border: '#E5E7EB',
+        background: '#0F1117', // app canvas (deep slate)
+        surface: '#1A1D27', // panels
+        field: '#232735', // inputs / interactive fields
+        'text-primary': '#E6E8EE', // soft white
+        'text-muted': '#9CA3B4',
+        'text-subtle': '#6B7080',
+        border: '#2D3142',
       },
       borderRadius: {
         md: '8px',

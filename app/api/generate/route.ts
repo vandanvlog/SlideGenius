@@ -1,49 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { parseFile } from '@/lib/file-parser';
-import { generateOutline } from '@/lib/claude';
+import { generateSlides } from '@/lib/claude';
 import { fetchImageUrl } from '@/lib/unsplash';
-import { generatePresentation, type SlideWithImage } from '@/lib/pptx-generator';
-import type { ApiErrorCode } from '@/lib/types';
+import type { SlideData } from '@/lib/types';
 
-// PDF/DOCX parsing + PPT generation need the Node runtime (not Edge).
 export const runtime = 'nodejs';
-// Generation can take a while; allow up to 60s on platforms that honor this.
 export const maxDuration = 60;
 
-const requestSchema = z
+const schema = z
   .object({
-    fileContent: z.string().optional(),
-    fileName: z.string().optional(),
-    prompt: z.string().optional(),
-    style: z
-      .enum(['academic', 'business', 'creative', 'legal'])
-      .default('business'),
-    slideCount: z.enum(['5', '10', '15', '20']).default('10'),
+    description: z.string().optional().default(''),
+    presentationType: z.string().default('business'),
+    slideCount: z.union([z.literal(5), z.literal(10), z.literal(15), z.literal(20)]),
+    hasCustomImages: z.boolean().default(false),
+    customImageCount: z.number().int().min(0).default(0),
+    paletteId: z.string().optional(),
+    attachedFiles: z
+      .array(z.object({ name: z.string(), content: z.string() }))
+      .optional()
+      .default([]),
   })
-  .refine((data) => Boolean(data.fileContent) || Boolean(data.prompt), {
-    message: 'Either a file or a prompt is required.',
-  })
-  .refine(
-    (data) =>
-      !data.fileContent ||
-      (data.fileName
-        ? /\.(pdf|docx)$/i.test(data.fileName)
-        : false),
-    {
-      message: 'Uploaded file must be a .pdf or .docx and include a filename.',
-    }
-  );
+  .refine((d) => d.description.trim().length > 0 || d.attachedFiles.length > 0, {
+    message: 'Please describe your presentation or attach a file.',
+  });
 
-function errorResponse(code: ApiErrorCode, message: string, status: number) {
-  return NextResponse.json(
-    { success: false, error: { code, message } },
-    { status }
-  );
+function errorResponse(code: string, message: string, status: number) {
+  return NextResponse.json({ success: false, error: { code, message } }, { status });
 }
 
 export async function POST(req: NextRequest) {
-  // 1. Parse + validate input
   let body: unknown;
   try {
     body = await req.json();
@@ -51,43 +37,45 @@ export async function POST(req: NextRequest) {
     return errorResponse('INVALID_INPUT', 'Request body must be valid JSON.', 400);
   }
 
-  const parsed = requestSchema.safeParse(body);
+  const parsed = schema.safeParse(body);
   if (!parsed.success) {
-    const message = parsed.error.issues[0]?.message ?? 'Invalid request.';
-    return errorResponse('INVALID_INPUT', message, 400);
+    return errorResponse(
+      'INVALID_INPUT',
+      parsed.error.issues[0]?.message ?? 'Invalid request.',
+      400
+    );
   }
 
-  const { fileContent, fileName, prompt, style, slideCount } = parsed.data;
+  const { description, presentationType, slideCount, hasCustomImages, attachedFiles } =
+    parsed.data;
 
   try {
-    // 2. Resolve source content (file takes precedence over prompt)
-    let content: string;
-    if (fileContent && fileName) {
-      try {
-        content = await parseFile(fileContent, fileName);
-      } catch {
-        return errorResponse(
-          'INVALID_FILE',
-          "We couldn't read that file. Please upload a valid PDF or Word (.docx) document.",
-          400
-        );
+    // 1. Build source content from description + any attached PDF/DOCX files.
+    const parts: string[] = [];
+    if (description.trim()) parts.push(description.trim());
+    for (const file of attachedFiles) {
+      if (/\.(pdf|docx)$/i.test(file.name)) {
+        try {
+          const text = await parseFile(file.content, file.name);
+          if (text) parts.push(`From ${file.name}:\n${text}`);
+        } catch {
+          // Skip unreadable files but keep going.
+        }
       }
-    } else {
-      content = prompt!.trim();
     }
-
+    const content = parts.join('\n\n').trim();
     if (!content) {
       return errorResponse(
         'INVALID_INPUT',
-        'No usable content was found. Try a different file or prompt.',
+        'No usable content found. Add a description or a readable PDF/DOCX.',
         400
       );
     }
 
-    // 3. Generate the outline with Claude
-    let slides;
+    // 2. Generate the outline.
+    let outlines;
     try {
-      slides = await generateOutline(content, style, parseInt(slideCount, 10));
+      outlines = await generateSlides(content, presentationType, slideCount, hasCustomImages);
     } catch (err) {
       if (err instanceof Error && err.message === 'SERVER_MISCONFIGURED') {
         return errorResponse(
@@ -103,46 +91,29 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 4. Fetch images in parallel (graceful — failures yield empty strings)
-    const imageResults = await Promise.allSettled(
-      slides.map((slide) => fetchImageUrl(slide.imageKeywords))
-    );
-    const slidesWithImages: SlideWithImage[] = slides.map((slide, i) => ({
-      ...slide,
-      imageUrl:
-        imageResults[i].status === 'fulfilled' ? imageResults[i].value : '',
-    }));
-
-    // 5. Build the PowerPoint
-    let buffer: Buffer;
-    try {
-      buffer = await generatePresentation(slidesWithImages);
-    } catch {
-      return errorResponse(
-        'GENERATION_FAILED',
-        "We couldn't assemble the PowerPoint file. Please try again.",
-        500
+    // 3. Resolve images. Custom images are filled in by the client (it holds the
+    //    uploaded data URLs); here we only fetch Unsplash when not using custom.
+    let imageUrls: string[] = [];
+    if (!hasCustomImages) {
+      const results = await Promise.allSettled(
+        outlines.map((o) => fetchImageUrl(o.imageKeywords))
       );
+      imageUrls = results.map((r) => (r.status === 'fulfilled' ? r.value : ''));
     }
 
-    // 6. Stream the file back
-    const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    const fileNameOut = `Presentation_${timestamp}.pptx`;
+    const slides: SlideData[] = outlines.map((o, i) => ({
+      id: o.number,
+      type: o.type,
+      title: o.title,
+      content: o.content,
+      imageKeywords: o.imageKeywords,
+      speakerNotes: o.speakerNotes,
+      imageUrl: hasCustomImages ? '' : imageUrls[i] ?? '',
+      style: o.style,
+    }));
 
-    return new NextResponse(new Uint8Array(buffer), {
-      status: 200,
-      headers: {
-        'Content-Type':
-          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'Content-Disposition': `attachment; filename="${fileNameOut}"`,
-        'X-Slide-Count': String(slides.length),
-      },
-    });
+    return NextResponse.json({ success: true, slides });
   } catch {
-    return errorResponse(
-      'GENERATION_FAILED',
-      'Something went wrong while generating your presentation. Please try again.',
-      500
-    );
+    return errorResponse('GENERATION_FAILED', 'Something went wrong. Please try again.', 500);
   }
 }
